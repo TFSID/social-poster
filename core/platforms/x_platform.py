@@ -17,8 +17,6 @@ class XPlatform(BasePlatform):
             if "/login" in current_url or "/i/flow/login" in current_url:
                 return False
 
-            # Look for elements that indicate we're logged in
-            # We use a short timeout because we expect these to be present if logged in
             try:
                 await page.wait_for_selector('[data-testid="SideNav_AccountSwitcher_Button"]', timeout=3000)
                 return True
@@ -39,20 +37,14 @@ class XPlatform(BasePlatform):
 
             return False
         except Exception as e:
-            print(f"Failed to check login status for X: {e}")
+            # print(f"Failed to check login status for X: {e}")
             return False
 
     async def login(self, options: Optional[Dict[str, Any]] = None) -> bool:
-        """
-        Perform login.
-        If headless=False (interactive), it opens the browser and waits for the user to log in.
-        """
         options = options or {}
-        # Override headless option for this specific call if provided
         original_headless = self.headless
         if "headless" in options:
             self.headless = options["headless"]
-            # We need to re-launch browser if headless state changes, or just create a new page
             if self.browser:
                 await self.close_browser()
 
@@ -70,9 +62,7 @@ class XPlatform(BasePlatform):
 
             if not self.headless:
                 print("Please log in manually in the browser...")
-                # Wait for user to complete login manually
-                # We can poll for the existence of the account switcher or home element
-                max_wait = 300 # 5 minutes
+                max_wait = 300
                 start_time = asyncio.get_event_loop().time()
 
                 while (asyncio.get_event_loop().time() - start_time) < max_wait:
@@ -85,7 +75,6 @@ class XPlatform(BasePlatform):
                 print("Login timed out.")
                 return False
             else:
-                # Automated login logic would go here (not implemented for now as per instructions to focus on interactive)
                 print("Automated login not fully implemented, use interactive mode.")
                 return False
 
@@ -94,7 +83,7 @@ class XPlatform(BasePlatform):
             return False
         finally:
             await page.close()
-            self.headless = original_headless # Restore original setting
+            self.headless = original_headless
 
     async def post(self, content: Dict[str, Any]) -> Dict[str, Any]:
         """Post content to X."""
@@ -105,15 +94,11 @@ class XPlatform(BasePlatform):
             if not await self.is_logged_in(page):
                 return {"success": False, "error": "Authentication required"}
 
-            # Navigate to compose
             try:
                 compose_btn = await self.wait_for_element(page, '[data-testid="SideNav_NewTweet_Button"]')
                 await compose_btn.click()
                 await self.wait_for_element(page, '[data-testid="tweetTextarea_0"]')
             except Exception as e:
-                # Maybe we are already on a page with a text area (like /compose/tweet) or mobile view?
-                # Or just try typing directly if on home?
-                # For now fail if not found
                 return {"success": False, "error": f"Could not open compose dialog: {e}"}
 
             text = content.get("text", "")
@@ -125,15 +110,12 @@ class XPlatform(BasePlatform):
 
             await self.type_text(page, '[data-testid="tweetTextarea_0"]', full_text)
 
-            # Wait a bit for link preview
             await page.wait_for_timeout(2000)
 
             submit_btn = await self.wait_for_element(page, '[data-testid="tweetButtonInline"]')
             await submit_btn.click()
 
-            # Wait for post success (URL change to status)
             try:
-                # Wait for URL to match regex /status/
                 await page.wait_for_url(lambda url: "/status/" in url, timeout=15000)
                 return {
                     "success": True,

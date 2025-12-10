@@ -24,7 +24,6 @@ class BrowserAutomation:
         self.browserless_token = self.options.get("browserless_token")
         self.use_browserless = self.options.get("use_browserless", False)
         self.browserless_session_id: Optional[str] = None
-        self.browserless_stop_url: Optional[str] = None
 
     async def launch_browser(self) -> Browser:
         """Launch Playwright browser (Local or Browserless)."""
@@ -40,22 +39,7 @@ class BrowserAutomation:
             if session_data:
                 connect_url = session_data['connect']
                 self.browserless_session_id = session_data['id']
-                # Construct stop URL: The create response doesn't usually give stop URL directly in all versions,
-                # but typically it's .../session/{id}?token=...
-                # The user snippet implies we get a session object.
-                # Assuming standard Browserless Session API.
-                # User snippet: await stop_session('https://production-sfo.browserless.io/e/57..09/session/57..09?token=...')
-                # We need to construct this or extract it.
-                # Actually, connectOverCDP returns a browser.
-
                 self.browser = await self.playwright.chromium.connect_over_cdp(connect_url)
-
-                # Store stop URL construction logic or use what we can
-                # session_data usually has 'id'.
-                # Stop URL: https://production-sfo.browserless.io/session/{id}?token={token}
-                # Warning: Base URL depends on where the session was created (SFO, etc).
-                # User snippet uses https://production-sfo.browserless.io
-                # We should probably use the same base as create.
                 return self.browser
             else:
                 print("⚠️ Failed to create Browserless session. Falling back to local.")
@@ -78,17 +62,17 @@ class BrowserAutomation:
     async def create_browserless_session(self, token: str) -> Optional[Dict[str, Any]]:
         """Create a Browserless session via REST API."""
         try:
-            # We assume SFO as per user snippet, but this should ideally be configurable
+            # Assumes SFO region
             url = f"https://production-sfo.browserless.io/session?token={token}"
 
             session_config = {
-                "ttl": 180000, # 3 mins, adjustable
+                "ttl": 300000, # 5 mins for interaction
                 "stealth": True,
-                "headless": self.headless,
-                "args": ["--no-sandbox"]
+                "headless": False, # Important for interactive session? Or headless=False in args?
+                                   # Session API 'headless' param controls if X11 is used?
+                                   # Usually headless: false is needed for visual debugging.
             }
 
-            # Use run_in_executor to make sync requests async
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(None, lambda: requests.post(
                 url,
@@ -127,19 +111,11 @@ class BrowserAutomation:
     async def close_browser(self):
         """Close browser and playwright."""
         if self.browser:
-            # If browserless, we might want to use disconnect() first as per instructions?
-            # Instructions: "Use disconnect() instead of close() to keep browser alive for reconnection"
-            # BUT we are implementing the Session API approach which has explicit create/delete.
-            # If we are done with the task, we should probably close it to save money/resources,
-            # UNLESS we implement a persistent session pool.
-            # For this MVP, we will close it (stop session) to be clean.
+            await self.browser.close()
 
             if self.use_browserless and self.browserless_session_id:
-                await self.browser.close() # Close connection
                 await self.stop_browserless_session(self.browserless_session_id, self.browserless_token)
                 self.browserless_session_id = None
-            else:
-                await self.browser.close()
 
             self.browser = None
 
@@ -151,18 +127,13 @@ class BrowserAutomation:
         """Create a new page with session restoration."""
         browser = await self.launch_browser()
 
-        # Create context with viewport and user agent
-        # Note: connect_over_cdp returns a browser that might already have contexts.
-        # User snippet: "const context = browser.contexts[0]"
-        # If we use new_context(), it creates an incognito context on top of the session?
-        # Browserless sessions usually act as a browser instance.
-
+        # When using connect_over_cdp, we often attach to the existing target or create new context
+        # Ideally, we create a new context to be safe
         context = await browser.new_context(
             viewport=self.viewport,
             user_agent=self.user_agent
         )
 
-        # Restore session if available
         session = self.session_manager.get_session(platform)
         if session and self.session_manager.is_session_valid(platform):
             await self.restore_session(context, session)
@@ -173,7 +144,6 @@ class BrowserAutomation:
     async def restore_session(self, context: BrowserContext, session: Dict[str, Any]):
         """Restore session data to context."""
         try:
-            # Set cookies
             cookies = session.get("cookies", [])
             if cookies:
                 await context.add_cookies(cookies)
@@ -185,11 +155,8 @@ class BrowserAutomation:
         try:
             context = page.context
             cookies = await context.cookies()
-
-            # Get user agent
             user_agent = await page.evaluate("() => navigator.userAgent")
 
-            # Get storage
             local_storage = await page.evaluate("""() => {
                 const storage = {};
                 for (let i = 0; i < localStorage.length; i++) {
@@ -238,7 +205,7 @@ class BrowserAutomation:
 
     async def type_text(self, page: Page, selector: str, text: str, delay: int = 50):
         element = await self.wait_for_element(page, selector)
-        await element.click(click_count=3) # Select all
+        await element.click(click_count=3)
         await element.press("Backspace")
         await element.type(text, delay=delay)
 
