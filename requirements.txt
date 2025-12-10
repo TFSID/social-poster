@@ -1,0 +1,7 @@
+streamlit
+playwright
+openai
+pandas
+plotly
+watchdog
+nest_asyncio
