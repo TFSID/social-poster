@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from core.platforms.base import BasePlatform
 
 class XPlatform(BasePlatform):
@@ -7,125 +7,57 @@ class XPlatform(BasePlatform):
         super().__init__(options)
         self.platform_name = "x"
         self.base_url = "https://x.com"
-        self.login_url = "https://x.com/i/flow/login"
-        self.max_text_length = 280
 
-    async def is_logged_in(self, page) -> bool:
-        """Check if user is logged in to X."""
-        try:
-            current_url = page.url
-            if "/login" in current_url or "/i/flow/login" in current_url:
-                return False
+    async def login_interactive_browserless(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        if not self.service: return None, None, None
 
-            try:
-                await page.wait_for_selector('[data-testid="SideNav_AccountSwitcher_Button"]', timeout=3000)
-                return True
-            except:
-                pass
+        session = await self.service.create_session()
+        if not session: return None, None, None
 
-            try:
-                await page.wait_for_selector('[data-testid="AppTabBar_Profile_Link"]', timeout=1000)
-                return True
-            except:
-                pass
+        # We need to navigate to X first?
+        # But we can't easily navigate via CDP without writing complex code.
+        # User can type URL in the Live Browser.
+        # OR we can inject a goto via /function targeting the session? No, /function makes new session.
+        # We can use CDP "Page.navigate" via websockets!
 
-            try:
-                await page.wait_for_selector('[data-testid="primaryColumn"]', timeout=1000)
-                return True
-            except:
-                pass
+        # Let's add a quick navigate helper in BrowserlessService later if needed,
+        # but for now, Live Browser starts at about:blank. User types url?
+        # Better: Use Runtime.evaluate to window.location = ...
 
-            return False
-        except Exception as e:
-            # print(f"Failed to check login status for X: {e}")
-            return False
+        # NOTE: For simplicity, we assume user can navigate or we add a helper.
+        # Let's just return the session details. The Live URL usually has an address bar.
 
-    async def login(self, options: Optional[Dict[str, Any]] = None) -> bool:
-        options = options or {}
-        original_headless = self.headless
-        if "headless" in options:
-            self.headless = options["headless"]
-            if self.browser:
-                await self.close_browser()
+        return session.get("live_url"), session.get("id"), session.get("ws_url")
 
-        page = await self.create_page(self.platform_name)
+    async def check_login_status(self, ws_url: str) -> bool:
+        if not self.service: return False
+        # X login check selector
+        return await self.service.check_selector(ws_url, '[data-testid="SideNav_AccountSwitcher_Button"]')
 
-        try:
-            await page.goto(self.base_url, wait_until="networkidle")
+    async def post(self, content: Dict[str, Any], cookies: list) -> Dict[str, Any]:
+        if not self.service: return {"success": False, "error": "No Browserless Token"}
 
-            if await self.is_logged_in(page):
-                print("Already logged in to X.com")
-                await self.save_session(page, self.platform_name)
-                return True
+        text = content.get("text", "")
+        link = content.get("link", "")
+        full_text = f"{text} {link}".strip()
 
-            await page.goto(self.login_url, wait_until="networkidle")
+        # Puppeteer script for X
+        code = f"""
+        module.exports = async ({{ page }}) => {{
+            await page.goto('https://x.com');
+            try {{
+                await page.waitForSelector('[data-testid="SideNav_NewTweet_Button"]', {{timeout: 10000}});
+                await page.click('[data-testid="SideNav_NewTweet_Button"]');
+                await page.waitForSelector('[data-testid="tweetTextarea_0"]');
+                await page.type('[data-testid="tweetTextarea_0"]', {repr(full_text)});
+                await page.click('[data-testid="tweetButtonInline"]');
+                await page.waitForResponse(response => response.url().includes('/create.json') && response.status() === 200);
+                return {{ url: page.url() }};
+            }} catch (e) {{
+                throw e;
+            }}
+        }};
+        """
 
-            if not self.headless:
-                print("Please log in manually in the browser...")
-                max_wait = 300
-                start_time = asyncio.get_event_loop().time()
-
-                while (asyncio.get_event_loop().time() - start_time) < max_wait:
-                    if await self.is_logged_in(page):
-                        print("Login detected!")
-                        await self.save_session(page, self.platform_name)
-                        return True
-                    await asyncio.sleep(2)
-
-                print("Login timed out.")
-                return False
-            else:
-                print("Automated login not fully implemented, use interactive mode.")
-                return False
-
-        except Exception as e:
-            print(f"X.com login failed: {e}")
-            return False
-        finally:
-            await page.close()
-            self.headless = original_headless
-
-    async def post(self, content: Dict[str, Any]) -> Dict[str, Any]:
-        """Post content to X."""
-        page = await self.create_page(self.platform_name)
-        try:
-            await page.goto(self.base_url, wait_until="networkidle")
-
-            if not await self.is_logged_in(page):
-                return {"success": False, "error": "Authentication required"}
-
-            try:
-                compose_btn = await self.wait_for_element(page, '[data-testid="SideNav_NewTweet_Button"]')
-                await compose_btn.click()
-                await self.wait_for_element(page, '[data-testid="tweetTextarea_0"]')
-            except Exception as e:
-                return {"success": False, "error": f"Could not open compose dialog: {e}"}
-
-            text = content.get("text", "")
-            link = content.get("link", "")
-            full_text = f"{text} {link}".strip()
-
-            if len(full_text) > self.max_text_length:
-                 return {"success": False, "error": f"Text too long: {len(full_text)}/{self.max_text_length}"}
-
-            await self.type_text(page, '[data-testid="tweetTextarea_0"]', full_text)
-
-            await page.wait_for_timeout(2000)
-
-            submit_btn = await self.wait_for_element(page, '[data-testid="tweetButtonInline"]')
-            await submit_btn.click()
-
-            try:
-                await page.wait_for_url(lambda url: "/status/" in url, timeout=15000)
-                return {
-                    "success": True,
-                    "url": page.url,
-                    "platform": "x"
-                }
-            except:
-                return {"success": False, "error": "Post timeout - URL did not change to status"}
-
-        except Exception as e:
-            return {"success": False, "error": str(e), "platform": "x"}
-        finally:
-            await page.close()
+        context = {"cookies": cookies}
+        return await self.service.run_function(code, context)

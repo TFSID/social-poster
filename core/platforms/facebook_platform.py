@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from core.platforms.base import BasePlatform
 
 class FacebookPlatform(BasePlatform):
@@ -7,127 +7,65 @@ class FacebookPlatform(BasePlatform):
         super().__init__(options)
         self.platform_name = "facebook"
         self.base_url = "https://www.facebook.com"
-        self.login_url = "https://www.facebook.com/login"
 
-    async def is_logged_in(self, page) -> bool:
-        """Check if user is logged in to Facebook."""
-        try:
-            current_url = page.url
-            if "/login" in current_url:
-                return False
+    async def login_interactive_browserless(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        if not self.service: return None, None, None
+        session = await self.service.create_session()
+        if not session: return None, None, None
+        return session.get("live_url"), session.get("id"), session.get("ws_url")
 
-            try:
-                await page.wait_for_selector('div[role="banner"]', timeout=3000)
-                if await page.query_selector('div[role="feed"]'):
-                    return True
-                if await page.query_selector('[aria-label="Account controls and settings"]'):
-                    return True
-                return False
-            except:
-                return False
-        except Exception as e:
-            # print(f"Failed to check login status for Facebook: {e}")
-            return False
+    async def check_login_status(self, ws_url: str) -> bool:
+        if not self.service: return False
+        # Facebook login check
+        is_feed = await self.service.check_selector(ws_url, 'div[role="feed"]')
+        is_account = await self.service.check_selector(ws_url, '[aria-label="Account controls and settings"]')
+        return is_feed or is_account
 
-    async def login(self, options: Optional[Dict[str, Any]] = None) -> bool:
-        options = options or {}
-        original_headless = self.headless
-        if "headless" in options:
-            self.headless = options["headless"]
-            if self.browser:
-                await self.close_browser()
+    async def post(self, content: Dict[str, Any], cookies: list) -> Dict[str, Any]:
+        if not self.service: return {"success": False, "error": "No Browserless Token"}
 
-        page = await self.create_page(self.platform_name)
+        text = content.get("text", "")
+        link = content.get("link", "")
+        full_text = f"{text}\\n\\n{link}".strip()
 
-        try:
-            await page.goto(self.base_url, wait_until="networkidle")
+        # Puppeteer script for Facebook
+        # Note: FB is complex. This is a best-effort script based on previous logic.
+        code = f"""
+        module.exports = async ({{ page }}) => {{
+            await page.goto('https://facebook.com');
+            try {{
+                // Handle cookies if present
+                try {{ await page.click('[data-testid="cookie-policy-manage-dialog-accept-button"]'); }} catch(e) {{}}
 
-            try:
-                await page.click('[data-testid="cookie-policy-manage-dialog-accept-button"]', timeout=2000)
-            except:
-                pass
+                await page.waitForSelector('div[role="feed"]', {{timeout: 10000}});
 
-            if await self.is_logged_in(page):
-                print("Already logged in to Facebook")
-                await self.save_session(page, self.platform_name)
-                return True
+                // Click "What's on your mind"
+                await page.evaluate(() => {{
+                    const els = Array.from(document.querySelectorAll('div[role="button"] span'));
+                    const target = els.find(el => el.textContent.includes("What's on your mind") || el.textContent.includes("What"));
+                    if (target) target.click();
+                    else throw new Error("Create post trigger not found");
+                }});
 
-            if not self.headless:
-                print("Please log in manually in the browser...")
-                max_wait = 300
-                start_time = asyncio.get_event_loop().time()
+                await page.waitForSelector('div[role="dialog"][aria-label="Create post"]');
+                await page.waitForSelector('div[contenteditable="true"][role="textbox"]');
 
-                while (asyncio.get_event_loop().time() - start_time) < max_wait:
-                    if await self.is_logged_in(page):
-                        print("Login detected!")
-                        await self.save_session(page, self.platform_name)
-                        return True
-                    await asyncio.sleep(2)
+                await page.click('div[contenteditable="true"][role="textbox"]');
+                await page.keyboard.type({repr(full_text)});
 
-                print("Login timed out.")
-                return False
-            else:
-                print("Automated login not implemented for Facebook.")
-                return False
+                await page.waitForTimeout(3000); // Wait for preview
 
-        except Exception as e:
-            print(f"Facebook login failed: {e}")
-            return False
-        finally:
-            await page.close()
-            self.headless = original_headless
+                await page.click('div[aria-label="Post"]');
 
-    async def post(self, content: Dict[str, Any]) -> Dict[str, Any]:
-        """Post content to Facebook."""
-        page = await self.create_page(self.platform_name)
-        try:
-            await page.goto(self.base_url, wait_until="networkidle")
+                // Wait for modal to disappear
+                await page.waitForFunction(() => !document.querySelector('div[role="dialog"][aria-label="Create post"]'));
 
-            if not await self.is_logged_in(page):
-                return {"success": False, "error": "Authentication required"}
+                return {{ success: true }};
+            }} catch (e) {{
+                throw e;
+            }}
+        }};
+        """
 
-            try:
-                create_post_trigger = await page.wait_for_selector('div[role="button"] span:has-text("What\'s on your mind")', timeout=5000)
-                if not create_post_trigger:
-                     create_post_trigger = await page.wait_for_selector('div[role="button"] span:has-text("What")', timeout=1000)
-
-                await create_post_trigger.click()
-            except Exception as e:
-                return {"success": False, "error": f"Could not find 'Create Post' trigger: {e}"}
-
-            try:
-                modal = await page.wait_for_selector('div[role="dialog"][aria-label="Create post"]', timeout=5000)
-                input_area = await modal.wait_for_selector('div[contenteditable="true"][role="textbox"]', timeout=2000)
-            except Exception as e:
-                 return {"success": False, "error": f"Could not find post modal/input: {e}"}
-
-            text = content.get("text", "")
-            link = content.get("link", "")
-            full_text = f"{text}\n\n{link}".strip()
-
-            await input_area.click()
-            await page.keyboard.type(full_text)
-
-            if link:
-                await page.wait_for_timeout(3000)
-
-            try:
-                post_btn = await modal.wait_for_selector('div[aria-label="Post"]', timeout=2000)
-                await post_btn.click()
-            except Exception as e:
-                return {"success": False, "error": f"Could not find or click 'Post' button: {e}"}
-
-            try:
-                await page.wait_for_selector('div[role="dialog"][aria-label="Create post"]', state="hidden", timeout=10000)
-                return {
-                    "success": True,
-                    "platform": "facebook",
-                    "timestamp": asyncio.get_event_loop().time()
-                }
-            except:
-                return {"success": False, "error": "Post timeout - Modal did not close"}
-
-        except Exception as e:
-            return {"success": False, "error": str(e), "platform": "facebook"}
-        finally:
-            await page.close()
+        context = {"cookies": cookies}
+        return await self.service.run_function(code, context)
