@@ -1,0 +1,6 @@
+streamlit
+playwright
+pytest
+pandas
+matplotlib
+watchdog
