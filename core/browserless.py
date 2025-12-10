@@ -5,9 +5,9 @@ import websockets
 from typing import Optional, Dict, Any, List
 
 class BrowserlessService:
-    def __init__(self, token: str):
+    def __init__(self, token: str, base_url: str = "https://production-sfo.browserless.io"):
         self.token = token
-        self.base_url = "https://production-sfo.browserless.io"
+        self.base_url = base_url.rstrip("/")
 
     async def create_session(self, url: str = "about:blank") -> Optional[Dict[str, Any]]:
         """
@@ -35,14 +35,19 @@ class BrowserlessService:
 
             data = response.json()
             session_id = data.get("id")
-            # Construct derived URLs
-            # Live URL: https://chrome.browserless.io/live/{id}?token={token}
-            # Note: Might vary by region, but chrome.browserless.io usually routes correctly.
-            live_url = f"https://chrome.browserless.io/live/{session_id}?token={self.token}"
 
-            # WSS URL for CDP: provided in 'connect' usually, but we need raw WSS not Puppeteer endpoint?
-            # 'connect' field is like: wss://.../session/connect/{id}
-            ws_url = data.get("connect") # This works with generic CDP clients usually
+            # Construct derived URLs
+            # Use the same base URL as the session creation
+            live_url = f"{self.base_url}/live/{session_id}?token={self.token}"
+
+            # WS URL might be returned in data, or we construct it
+            ws_url = data.get("connect")
+            # If connect is not present (sometimes happens), try to construct it
+            if not ws_url:
+                 # Construct WSS from Base URL
+                 # https://host -> wss://host
+                 ws_base = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
+                 ws_url = f"{ws_base}/session/{session_id}?token={self.token}"
 
             return {
                 "id": session_id,
@@ -134,8 +139,6 @@ class BrowserlessService:
             ))
 
             if response.ok:
-                # Browserless returns content-type based on what the function returns
-                # Usually text or json
                 try:
                     return {"success": True, "data": response.json()}
                 except:
