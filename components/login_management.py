@@ -2,20 +2,9 @@ import streamlit as st
 import asyncio
 from core.session_manager import SessionManager
 
-def render_settings_page():
-    st.title("⚙️ Settings & Accounts")
-
-    # OpenAI Config
-    with st.expander("AI Configuration", expanded=True):
-        api_key = st.text_input("OpenAI API Key", type="password", value=st.session_state.ai_service.api_key or "")
-        if st.button("Save API Key"):
-            st.session_state.ai_service.set_api_key(api_key)
-            st.success("API Key saved!")
-
-    st.divider()
-
-    # Account Connections
-    st.subheader("Connect Accounts")
+def render_login_management():
+    st.title("🔐 Login Management")
+    st.markdown("Manage your social media account connections here.")
 
     col1, col2 = st.columns(2)
 
@@ -44,27 +33,38 @@ def render_platform_login_card(platform_key: str, platform_label: str):
 
 def handle_interactive_login(platform_key: str):
     """
-    Triggers the interactive login flow.
+    Triggers the interactive login flow using Local Browser (default).
     """
     status_container = st.empty()
     status_container.info(f"Opening browser for {platform_key}... Please check the new window.")
 
-    # We run this asynchronously
+    # Force use of local browser for interactive login
+    # We create a temporary platform instance with forced headless=False and use_browserless=False
+
     async def login_task():
-        platform_instance = st.session_state.post_service.platforms.get(platform_key)
-        if not platform_instance:
+        # Get the original options but override for local interactive
+        original_platform = st.session_state.post_service.platforms.get(platform_key)
+        if not original_platform:
             st.error("Platform not found")
             return
 
-        # Launch login with headless=False
-        success = await platform_instance.login(options={"headless": False})
-        return success
+        # We need to ensure we don't accidentally use Browserless for this specific login action
+        # even if it's enabled in settings.
+        original_use_browserless = getattr(original_platform, 'use_browserless', False)
+        original_platform.use_browserless = False
+
+        try:
+            success = await original_platform.login(options={"headless": False})
+            return success
+        finally:
+            # Restore settings
+            original_platform.use_browserless = original_use_browserless
 
     try:
         success = asyncio.run(login_task())
         if success:
             status_container.success(f"Successfully logged in to {platform_key}!")
-            # Reload session manager to pick up new file
+            # Reload session manager
             st.session_state.session_manager = SessionManager()
             st.rerun()
         else:

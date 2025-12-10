@@ -5,3 +5,4 @@ pandas
 plotly
 watchdog
 nest_asyncio
+requests

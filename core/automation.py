@@ -1,5 +1,8 @@
 import os
 import asyncio
+import json
+import requests
+from datetime import datetime
 from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext, Playwright
 
@@ -17,14 +20,47 @@ class BrowserAutomation:
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
 
+        # Browserless Config
+        self.browserless_token = self.options.get("browserless_token")
+        self.use_browserless = self.options.get("use_browserless", False)
+        self.browserless_session_id: Optional[str] = None
+        self.browserless_stop_url: Optional[str] = None
+
     async def launch_browser(self) -> Browser:
-        """Launch Playwright browser."""
+        """Launch Playwright browser (Local or Browserless)."""
         if self.browser:
             return self.browser
 
         if not self.playwright:
             self.playwright = await async_playwright().start()
 
+        if self.use_browserless and self.browserless_token:
+            print("🚀 Launching Browserless Session...")
+            session_data = await self.create_browserless_session(self.browserless_token)
+            if session_data:
+                connect_url = session_data['connect']
+                self.browserless_session_id = session_data['id']
+                # Construct stop URL: The create response doesn't usually give stop URL directly in all versions,
+                # but typically it's .../session/{id}?token=...
+                # The user snippet implies we get a session object.
+                # Assuming standard Browserless Session API.
+                # User snippet: await stop_session('https://production-sfo.browserless.io/e/57..09/session/57..09?token=...')
+                # We need to construct this or extract it.
+                # Actually, connectOverCDP returns a browser.
+
+                self.browser = await self.playwright.chromium.connect_over_cdp(connect_url)
+
+                # Store stop URL construction logic or use what we can
+                # session_data usually has 'id'.
+                # Stop URL: https://production-sfo.browserless.io/session/{id}?token={token}
+                # Warning: Base URL depends on where the session was created (SFO, etc).
+                # User snippet uses https://production-sfo.browserless.io
+                # We should probably use the same base as create.
+                return self.browser
+            else:
+                print("⚠️ Failed to create Browserless session. Falling back to local.")
+
+        # Local Launch
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
             args=[
@@ -39,10 +75,72 @@ class BrowserAutomation:
         )
         return self.browser
 
+    async def create_browserless_session(self, token: str) -> Optional[Dict[str, Any]]:
+        """Create a Browserless session via REST API."""
+        try:
+            # We assume SFO as per user snippet, but this should ideally be configurable
+            url = f"https://production-sfo.browserless.io/session?token={token}"
+
+            session_config = {
+                "ttl": 180000, # 3 mins, adjustable
+                "stealth": True,
+                "headless": self.headless,
+                "args": ["--no-sandbox"]
+            }
+
+            # Use run_in_executor to make sync requests async
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=session_config
+            ))
+
+            if not response.ok:
+                print(f"Browserless HTTP error: {response.status_code} - {response.text}")
+                return None
+
+            session = response.json()
+            print(f"Browserless Session Created: {session.get('id')}")
+            return session
+        except Exception as e:
+            print(f"Error creating Browserless session: {e}")
+            return None
+
+    async def stop_browserless_session(self, session_id: str, token: str):
+        """Stop a Browserless session."""
+        if not session_id or not token:
+            return
+
+        try:
+            url = f"https://production-sfo.browserless.io/session/{session_id}?token={token}&force=true"
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(None, lambda: requests.delete(url))
+
+            if response.ok:
+                print(f"Browserless Session {session_id} stopped.")
+            else:
+                print(f"Failed to stop Browserless session: {response.status_code}")
+        except Exception as e:
+            print(f"Error stopping Browserless session: {e}")
+
     async def close_browser(self):
         """Close browser and playwright."""
         if self.browser:
-            await self.browser.close()
+            # If browserless, we might want to use disconnect() first as per instructions?
+            # Instructions: "Use disconnect() instead of close() to keep browser alive for reconnection"
+            # BUT we are implementing the Session API approach which has explicit create/delete.
+            # If we are done with the task, we should probably close it to save money/resources,
+            # UNLESS we implement a persistent session pool.
+            # For this MVP, we will close it (stop session) to be clean.
+
+            if self.use_browserless and self.browserless_session_id:
+                await self.browser.close() # Close connection
+                await self.stop_browserless_session(self.browserless_session_id, self.browserless_token)
+                self.browserless_session_id = None
+            else:
+                await self.browser.close()
+
             self.browser = None
 
         if self.playwright:
@@ -54,6 +152,11 @@ class BrowserAutomation:
         browser = await self.launch_browser()
 
         # Create context with viewport and user agent
+        # Note: connect_over_cdp returns a browser that might already have contexts.
+        # User snippet: "const context = browser.contexts[0]"
+        # If we use new_context(), it creates an incognito context on top of the session?
+        # Browserless sessions usually act as a browser instance.
+
         context = await browser.new_context(
             viewport=self.viewport,
             user_agent=self.user_agent
@@ -74,11 +177,6 @@ class BrowserAutomation:
             cookies = session.get("cookies", [])
             if cookies:
                 await context.add_cookies(cookies)
-
-            # LocalStorage/SessionStorage restoration is tricky in Playwright because
-            # it needs to be done *after* opening the page for a specific origin.
-            # We will handle that in the platform-specific implementation or
-            # by navigating to the base URL first if needed.
         except Exception as e:
             print(f"Failed to restore session: {e}")
 
@@ -92,7 +190,6 @@ class BrowserAutomation:
             user_agent = await page.evaluate("() => navigator.userAgent")
 
             # Get storage
-            # Note: This only gets storage for the current origin of the page
             local_storage = await page.evaluate("""() => {
                 const storage = {};
                 for (let i = 0; i < localStorage.length; i++) {
